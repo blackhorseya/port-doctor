@@ -1,9 +1,9 @@
 // Package doctor defines the diagnosis model of port-doctor and the
 // orchestration that turns raw socket and process facts into a Report.
 //
-// It knows nothing about operating systems: platform specifics live behind
-// the PortInspector and ProcessInspector interfaces, implemented in package
-// inspect.
+// It knows nothing about operating systems or container runtimes: platform
+// specifics live behind the PortInspector, ProcessInspector and
+// ContainerInspector interfaces, implemented in package inspect.
 package doctor
 
 import (
@@ -21,7 +21,7 @@ import (
 // Protocol is the transport protocol of a socket.
 type Protocol string
 
-// ProtocolTCP is the only protocol diagnosed in v0.1.
+// ProtocolTCP is the only protocol port-doctor diagnoses.
 const ProtocolTCP Protocol = "TCP"
 
 // Listener is a socket in the LISTEN state bound to the diagnosed port.
@@ -61,6 +61,45 @@ type ProcessInspector interface {
 	InspectProcess(c context.Context, pid int) (Process, error)
 }
 
+// Container is a running container that publishes the diagnosed port on
+// the host.
+type Container struct {
+	// Runtime is the command line tool that manages the container,
+	// "docker" or "podman"; suggestions are phrased with it.
+	Runtime string
+	// ID is the short container ID.
+	ID    string
+	Name  string
+	Image string
+	// Mappings are the container's published ports that match the
+	// diagnosed port, IPv4 before IPv6.
+	Mappings []PortMapping
+	// Compose is set when the container is managed by Compose.
+	Compose ComposeService
+}
+
+// PortMapping is one host address forwarded into a container.
+type PortMapping struct {
+	Host          netip.AddrPort
+	ContainerPort int
+	Protocol      Protocol
+}
+
+// ComposeService identifies the Compose project and service that own a
+// container. Zero when the container was not started by Compose.
+type ComposeService struct {
+	Project string
+	Service string
+}
+
+// ContainerInspector finds running containers that publish a host port.
+type ContainerInspector interface {
+	// PublishedContainers returns the running containers publishing port on
+	// this host. It returns nothing, and no error, when no container
+	// runtime is available.
+	PublishedContainers(c context.Context, port int) ([]Container, error)
+}
+
 var (
 	// ErrProcessNotFound reports that no process with the PID exists (any more).
 	ErrProcessNotFound = errors.New("process not found")
@@ -89,9 +128,11 @@ func ParsePort(s string) (int, error) {
 type Status int
 
 const (
-	// StatusAvailable means nothing is listening on the port.
+	// StatusAvailable means nothing is listening on the port and no
+	// container publishes it.
 	StatusAvailable Status = iota
-	// StatusInUse means at least one socket is listening on the port.
+	// StatusInUse means at least one socket is listening on the port or a
+	// container publishes it.
 	StatusInUse
 )
 
@@ -117,6 +158,9 @@ type Report struct {
 	Status       Status
 	Occupants    []Occupant
 	OtherSockets map[string]int
+	// Containers publish the port on the host, whether or not a host
+	// process was found listening for them.
+	Containers []Container
 	// Diagnosis is a one-sentence explanation; empty when the port is available.
 	Diagnosis   string
 	Suggestions []Suggestion
@@ -129,6 +173,9 @@ type Report struct {
 type Doctor struct {
 	Ports     PortInspector
 	Processes ProcessInspector
+	// Containers finds containers publishing the port. Optional: nil skips
+	// container detection.
+	Containers ContainerInspector
 	// ElevatedInspectCommand returns a platform command that can identify a
 	// listener when normal privileges are not enough. Optional.
 	ElevatedInspectCommand func(port int) string
@@ -137,7 +184,11 @@ type Doctor struct {
 // Diagnose explains the state of a local TCP port.
 //
 // Only a failure to list the port's sockets is an error. Missing process
-// metadata degrades the report and is explained in Report.Notes.
+// metadata and an unreachable container runtime degrade the report and are
+// explained in Report.Notes. A port published by a container counts as in
+// use even when no host process is listening for it, because the runtime
+// then forwards the traffic with packet rules and a new server would never
+// see a connection.
 func (x *Doctor) Diagnose(c context.Context, port int) (Report, error) {
 	info, err := x.Ports.InspectPort(c, port)
 	if err != nil {
@@ -145,20 +196,62 @@ func (x *Doctor) Diagnose(c context.Context, port int) (Report, error) {
 	}
 
 	r := Report{Port: port, OtherSockets: info.OtherSockets}
-	if len(info.Listeners) == 0 {
+	var containerNotes []string
+	r.Containers, containerNotes = x.publishedContainers(c, port)
+
+	if len(info.Listeners) == 0 && len(r.Containers) == 0 {
 		r.Status = StatusAvailable
 		if note := lingeringNote(port, info.OtherSockets); note != "" {
 			r.Notes = append(r.Notes, note)
 		}
+		r.Notes = append(r.Notes, containerNotes...)
 		return r, nil
 	}
 
 	r.Status = StatusInUse
-	r.Occupants, r.Notes = x.identify(c, info.Listeners)
-	r.Diagnosis = diagnosis(port, r.Occupants)
-	r.Suggestions = x.suggest(port, r.Occupants)
+	var notes []string
+	if len(info.Listeners) > 0 {
+		r.Occupants, notes = x.identify(c, info.Listeners)
+	}
+	if len(r.Containers) > 0 {
+		// The container explains an unidentified listener: on Linux it is
+		// docker-proxy running as root, which procfs cannot map to a PID.
+		notes = slices.DeleteFunc(notes, func(n string) bool { return n == unidentifiedNote })
+	}
+	notes = append(notes, forwarderNotes(port, r.Occupants, r.Containers)...)
+	r.Notes = dedupe(append(notes, containerNotes...))
+	r.Diagnosis = diagnosis(port, r.Occupants, r.Containers)
+	r.Suggestions = x.suggest(port, r.Occupants, r.Containers)
 	return r, nil
 }
+
+// publishedContainers asks the container inspector, if any, which containers
+// publish the port. Failures never abort the diagnosis: the listener facts
+// stand on their own and the failure becomes a note.
+func (x *Doctor) publishedContainers(c context.Context, port int) ([]Container, []string) {
+	if x.Containers == nil {
+		return nil, nil
+	}
+	cs, err := x.Containers.PublishedContainers(c, port)
+	var notes []string
+	if err != nil {
+		note := fmt.Sprintf("Containers were not checked: %v.", err)
+		if len(cs) > 0 {
+			note = fmt.Sprintf("Some containers may be missing: %v.", err)
+		}
+		if errors.Is(err, ErrPermission) {
+			note += " Only a user with access to the runtime socket can see them."
+		}
+		notes = append(notes, note)
+	}
+	slices.SortFunc(cs, func(a, b Container) int { return cmp.Or(cmp.Compare(a.Name, b.Name), cmp.Compare(a.ID, b.ID)) })
+	for i := range cs {
+		slices.SortFunc(cs[i].Mappings, func(a, b PortMapping) int { return a.Host.Compare(b.Host) })
+	}
+	return cs, notes
+}
+
+const unidentifiedNote = "The listening process could not be identified, usually because it belongs to another user."
 
 // identify groups listeners by PID and enriches each group with process
 // metadata, collecting a note for every way that enrichment can degrade.
@@ -181,7 +274,7 @@ func (x *Doctor) identify(c context.Context, listeners []Listener) ([]Occupant, 
 		occ := Occupant{Process: Process{PID: pid, User: firstUser(ls)}, Listeners: ls}
 
 		if pid == 0 {
-			notes = append(notes, "The listening process could not be identified, usually because it belongs to another user.")
+			notes = append(notes, unidentifiedNote)
 			occupants = append(occupants, occ)
 			continue
 		}
@@ -225,25 +318,51 @@ func dedupe(in []string) []string {
 	return out
 }
 
-func diagnosis(port int, occupants []Occupant) string {
-	if len(occupants) > 1 {
+func diagnosis(port int, occupants []Occupant, containers []Container) string {
+	switch {
+	case len(containers) > 1:
+		return fmt.Sprintf("%d containers publish port %d.", len(containers), port)
+	case len(containers) == 1:
+		ct := containers[0]
+		where := scope(mappingAddrs(ct.Mappings))
+		if len(occupants) == 0 {
+			return fmt.Sprintf("Container %s (%s) publishes port %d%s; no host process is listening, so the runtime forwards the traffic itself.", ct.Name, ct.Runtime, port, where)
+		}
+		return fmt.Sprintf("Container %s (%s) publishes port %d%s.", ct.Name, ct.Runtime, port, where)
+	case len(occupants) > 1:
 		return fmt.Sprintf("%d processes are listening on port %d.", len(occupants), port)
 	}
 	occ := occupants[0]
-	where := scope(occ.Listeners)
+	where := scope(listenerAddrs(occ.Listeners))
 	if occ.Process.PID == 0 {
 		return fmt.Sprintf("A process is listening on port %d%s, but it could not be identified.", port, where)
 	}
 	return fmt.Sprintf("Another process is listening on port %d%s.", port, where)
 }
 
-// scope summarises which interfaces the listeners cover, because
+func listenerAddrs(ls []Listener) []netip.Addr {
+	out := make([]netip.Addr, 0, len(ls))
+	for _, l := range ls {
+		out = append(out, l.Addr.Addr())
+	}
+	return out
+}
+
+func mappingAddrs(ms []PortMapping) []netip.Addr {
+	out := make([]netip.Addr, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, m.Host.Addr())
+	}
+	return out
+}
+
+// scope summarises which interfaces the addresses cover, because
 // 127.0.0.1:8080 and 0.0.0.0:8080 mean very different things to a developer.
-func scope(ls []Listener) string {
+func scope(addrs []netip.Addr) string {
 	loopback := true
 	ips := map[netip.Addr]bool{}
-	for _, l := range ls {
-		ip := l.Addr.Addr().Unmap()
+	for _, a := range addrs {
+		ip := a.Unmap()
 		if ip.IsUnspecified() {
 			return " (all interfaces)"
 		}
@@ -261,10 +380,51 @@ func scope(ls []Listener) string {
 	return ""
 }
 
+// runtimeForwarders are host processes that hold published ports on behalf
+// of a container runtime, keyed by process name. Killing one takes every
+// container offline, so they never get a kill suggestion even when the
+// container behind the port could not be found.
+var runtimeForwarders = map[string]string{
+	"docker-proxy":       "docker",
+	"com.docker.backend": "docker",
+	"vpnkit":             "docker",
+	"rootlesskit":        "docker",
+	"gvproxy":            "podman",
+	"rootlessport":       "podman",
+	"slirp4netns":        "podman",
+}
+
+// forwarderNotes explains listeners that are runtime port forwarders when no
+// container was found to account for them, typically because the runtime's
+// API socket is not enabled or not reachable.
+func forwarderNotes(port int, occupants []Occupant, containers []Container) []string {
+	if len(containers) > 0 {
+		return nil
+	}
+	var notes []string
+	for _, occ := range occupants {
+		runtime, ok := runtimeForwarders[occ.Process.Name]
+		if !ok {
+			continue
+		}
+		notes = append(notes, fmt.Sprintf("%s (PID %d) forwards ports for %s containers, but no container publishing port %d was found, so the runtime's API socket may be unreachable. Killing it would disconnect every container.",
+			occ.Process.Name, occ.Process.PID, runtime, port))
+	}
+	return notes
+}
+
 // suggest proposes conservative next steps. Nothing is executed.
-func (x *Doctor) suggest(port int, occupants []Occupant) []Suggestion {
+//
+// Once a container explains the port, the host listener is the runtime's
+// forwarder and the only sensible action is to stop the container, so no
+// process-level command is suggested at all.
+func (x *Doctor) suggest(port int, occupants []Occupant, containers []Container) []Suggestion {
+	if len(containers) > 0 {
+		return containerSuggestions(containers)
+	}
 	var inspect, stop, identify []string
 	for _, occ := range occupants {
+		_, forwarder := runtimeForwarders[occ.Process.Name]
 		switch {
 		case occ.Process.PID == 0:
 			if x.ElevatedInspectCommand != nil {
@@ -272,6 +432,8 @@ func (x *Doctor) suggest(port int, occupants []Occupant) []Suggestion {
 			}
 		case occ.Exited:
 			// A dead PID may be reused; never suggest killing it.
+		case forwarder:
+			inspect = append(inspect, fmt.Sprintf("%s ps", runtimeForwarders[occ.Process.Name]))
 		default:
 			inspect = append(inspect, fmt.Sprintf("ps -p %d", occ.Process.PID))
 			stop = append(stop, fmt.Sprintf("kill %d", occ.Process.PID))
@@ -289,6 +451,25 @@ func (x *Doctor) suggest(port int, occupants []Occupant) []Suggestion {
 		s = append(s, Suggestion{Title: "Identify (needs elevated privileges)", Commands: dedupe(identify)})
 	}
 	return s
+}
+
+// containerSuggestions phrases the next steps with the runtime's own CLI.
+// A Compose-managed container is stopped through Compose so that a later
+// `compose up` does not silently bring it back.
+func containerSuggestions(containers []Container) []Suggestion {
+	var inspect, stop []string
+	for _, ct := range containers {
+		inspect = append(inspect, fmt.Sprintf("%s logs --tail 20 %s", ct.Runtime, ct.Name))
+		if ct.Compose.Project != "" && ct.Compose.Service != "" {
+			stop = append(stop, fmt.Sprintf("%s compose -p %s stop %s", ct.Runtime, ct.Compose.Project, ct.Compose.Service))
+		} else {
+			stop = append(stop, fmt.Sprintf("%s stop %s", ct.Runtime, ct.Name))
+		}
+	}
+	return []Suggestion{
+		{Title: "Inspect", Commands: dedupe(inspect)},
+		{Title: "Stop", Commands: dedupe(stop)},
+	}
 }
 
 // lingeringNote explains why a bind may still fail on a port with no listener.
