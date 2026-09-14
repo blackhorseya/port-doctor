@@ -20,8 +20,8 @@ import (
 
 // Exit codes, as documented in the README.
 const (
-	exitAvailable = 0 // nothing is listening on the port
-	exitInUse     = 1 // a process is listening on the port
+	exitAvailable = 0 // nothing is listening on the port and no container publishes it
+	exitInUse     = 1 // a process is listening on the port or a container publishes it
 	exitError     = 2 // the diagnosis could not be performed
 )
 
@@ -45,6 +45,7 @@ var newDiagnoser = func() (Diagnoser, error) {
 	return &doctor.Doctor{
 		Ports:                  ports,
 		Processes:              procs,
+		Containers:             inspect.NewContainerInspector(),
 		ElevatedInspectCommand: inspect.ElevatedInspectCommand,
 	}, nil
 }
@@ -81,6 +82,8 @@ func newCommand(version string, report *doctor.Report) *cobra.Command {
 		Long: "port-doctor explains why a local TCP port is unavailable.\n\n" +
 			"It finds the process listening on the port, shows its PID, name and\n" +
 			"owner, the address it is bound to, and suggests what to do next.\n" +
+			"When a Docker or Podman container publishes the port, it names the\n" +
+			"container instead of the runtime's port forwarder.\n" +
 			"It never stops or modifies anything itself.",
 		Example: "  port-doctor 8080\n" +
 			"  port-doctor 5432",
