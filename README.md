@@ -33,10 +33,6 @@ $ port-doctor 3000
 ✓ Port 3000 is available
 ```
 
-<!-- Record docs/demo.gif with `task demo` (needs vhs), then add:
-![port-doctor demo](docs/demo.gif)
--->
-
 `listen tcp :8080: bind: address already in use` usually means a detour
 through `lsof`, `ps`, `ss` or `netstat`, with different flags on every
 operating system. `port-doctor` answers the one question you actually have
