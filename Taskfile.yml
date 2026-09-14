@@ -30,6 +30,13 @@ tasks:
     cmds:
       - '{{.CONTAINER_RUNTIME}} run --rm -v "{{.ROOT_DIR}}:/src" -w /src -e GOFLAGS=-buildvcs=false golang:1.27 go test ./...'
 
+  test-container:
+    desc: Run the container-attribution test against the local Docker or Podman (starts and removes one alpine container)
+    env:
+      PORT_DOCTOR_CONTAINER_TEST: "1"
+    cmds:
+      - go test ./internal/inspect -run TestRealContainer -v
+
   lint:
     desc: Run go vet and golangci-lint for both supported platforms
     cmds:
