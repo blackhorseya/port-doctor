@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`port-doctor <port>` — a small Go CLI that answers "what's using this port?" for a local TCP port on macOS and Linux: the listening process (PID, name, owner), the exact bound address, a one-line diagnosis and conservative next-step commands. v0.1 is deliberately narrow: no killing, no `--free`, no Docker/Kubernetes, no UDP, no scanning, no config files, no daemon, no telemetry. It must never terminate or modify another process. When scope is unclear, pick the smaller implementation.
+`port-doctor <port>` — a small Go CLI that answers "what's using this port?" for a local TCP port on macOS and Linux: the listening process (PID, name, owner), the exact bound address, the Docker or Podman container that publishes the port (v0.2), a one-line diagnosis and conservative next-step commands. Scope stays deliberately narrow: no killing, no `--free`, no Kubernetes, no remote (`tcp://`, `ssh://`) container hosts, no UDP, no scanning, no config files, no daemon, no telemetry. It must never terminate or modify another process, and it never runs the `docker` or `podman` CLI. When scope is unclear, pick the smaller implementation.
 
 ## Commands
 
@@ -14,6 +14,7 @@ Dev commands use [Task](https://taskfile.dev) (`Taskfile.yml`); binaries go to `
 task build        # ./bin/port-doctor, version stamped from git describe
 task test         # go test -race ./...  (integration tests open real listeners on localhost)
 task test-linux   # same suite inside a golang:1.27 container (Docker or Podman)
+task test-container # TestRealContainer against the local runtime (starts + removes one alpine container)
 task lint         # go vet + golangci-lint under GOOS=darwin and GOOS=linux (v2 config in .golangci.yml)
 task fmt          # gofmt + goimports via golangci-lint fmt
 task snapshot     # goreleaser release --snapshot --clean → ./dist
@@ -29,7 +30,8 @@ Four packages under `internal/`, wired by `cli.diagnose` in `internal/cli/cli.go
 ```
 doctor.ParsePort                      validate the argument (1–65535)
 inspect.New                           platform PortInspector + ProcessInspector (build-tagged constructors)
-doctor.Doctor.Diagnose                orchestration: list sockets → group by PID → enrich → diagnosis + suggestions
+inspect.NewContainerInspector         ContainerInspector over Docker/Podman API sockets (no build tags)
+doctor.Doctor.Diagnose                orchestration: list sockets → ask runtimes → group by PID → enrich → diagnosis + suggestions
 presenter.Render                      terminal output (lipgloss v2, plain text when not a TTY)
 ```
 
@@ -37,10 +39,13 @@ presenter.Render                      terminal output (lipgloss v2, plain text w
 
 ### Domain (`internal/doctor`)
 
-- The interfaces `PortInspector` and `ProcessInspector` are defined here, on the consumer side; `inspect` only returns concrete types. Doctor tests use fakes and never touch the OS.
+- The interfaces `PortInspector`, `ProcessInspector` and `ContainerInspector` are defined here, on the consumer side; `inspect` only returns concrete types. Doctor tests use fakes and never touch the OS. `Doctor.Containers` is optional: nil skips container detection entirely.
 - `Diagnose` returns an error only when the socket listing itself fails (exit 2). Everything about process metadata degrades into `Report.Notes`: `ErrProcessNotFound` marks the occupant `Exited` (and suppresses `kill` suggestions because the PID may be reused), `ErrPermission` adds the permissions note, any other error adds a generic note. `Listener.PID == 0` means "could not be identified"; `Listener.User` may still be known (Linux) and is used as a fallback for `Process.User`.
-- Occupants are grouped by PID, ordered by PID with the unidentified group last; listeners within a group are sorted IPv4 before IPv6. The diagnosis scope hint (`localhost only` / `all interfaces` / `<ip> only`) comes from `scope`; `Unmap()` is applied so `::ffff:0.0.0.0` counts as wildcard.
-- A port with no listener but sockets in other states (`TIME_WAIT`, `CLOSE_WAIT`, …) is still `StatusAvailable` (exit 0) with a note from `lingeringNote`.
+- When a container explains the port, the "could not be identified" note for a PID-0 listener is dropped (on Linux that listener is root's docker-proxy) and the elevated-identify hint is not suggested.
+- A failing container check also degrades into a note ("Containers were not checked: …", or "Some containers may be missing: …" when the inspector still returned some); the note carries the inspector's error text, so keep those errors short, lowercase and path-first. `ErrPermission` appends the "Only a user with access to the runtime socket" sentence.
+- Occupants are grouped by PID, ordered by PID with the unidentified group last; listeners within a group are sorted IPv4 before IPv6. Containers are sorted by name, their mappings IPv4 before IPv6. The diagnosis scope hint (`localhost only` / `all interfaces` / `<ip> only`) comes from `scope`, fed listener addresses or, when a container explains the port, mapping addresses; `Unmap()` is applied so `::ffff:0.0.0.0` counts as wildcard.
+- A port with no listener but sockets in other states (`TIME_WAIT`, `CLOSE_WAIT`, …) is still `StatusAvailable` (exit 0) with a note from `lingeringNote`. A port with no listener but a container publishing it is `StatusInUse` (exit 1) with no occupants: the runtime forwards with packet rules and a new server would never see a connection. Only fixtures cover this (default dockerd runs the userland proxy).
+- **Suggestions never contain `kill` for a container-published port.** When `Report.Containers` is non-empty, `suggest` returns only `<runtime> logs --tail 20 <name>` and `<runtime> stop <name>` (or `<runtime> compose -p <project> stop <service>` when both Compose labels are present) — no `ps`, no `kill`, no elevated-identify hint. Independently of container detection, `runtimeForwarders` (docker-proxy, com.docker.backend, vpnkit, rootlesskit, gvproxy, rootlessport, slirp4netns) never get a kill either: they get `<runtime> ps` and a note, because killing one disconnects every container. `Container.Runtime` is the CLI name (`docker` / `podman`) and is what suggestions are phrased with.
 
 ### Inspectors (`internal/inspect`)
 
@@ -50,6 +55,7 @@ presenter.Render                      terminal output (lipgloss v2, plain text w
 - **Linux reads `/proc/net/tcp{,6}` directly** (no `ss` dependency). Addresses are hex with each 4-byte word in host (little-endian) order; the port is big-endian. A missing `tcp6` table (IPv6 disabled) is not an error; both tables missing is. `socketOwners` walks `/proc/<pid>/fd` in ascending PID order and reports the lowest PID holding the socket (parent before forked workers), except PID 1 when any other owner exists (systemd socket activation). Unreadable fd tables (other users' processes) are skipped silently; the listener keeps its uid from `/proc/net/tcp`.
 - Linux process name prefers the `exe` link's base name (strip ` (deleted)`) over `comm`, which the kernel truncates to 15 bytes; `exe` is only readable for your own processes, so `comm` is the fallback.
 - `ElevatedInspectCommand` supplies the per-platform `sudo …` hint used when a PID is unknown.
+- **Containers (`container.go`, no build tags)** are found with one `GET /containers/json` per live runtime socket over `net/http` with a unix `DialContext`; Docker Engine and Podman's compat API answer identically and the `Server` header (`Docker/…` vs `Libpod/…`) decides `Runtime`. Candidate paths come from `containerSockets` (`$DOCKER_HOST` if `unix://`, `$XDG_RUNTIME_DIR/docker.sock` and `$XDG_RUNTIME_DIR/podman/podman.sock`, `/var/run/docker.sock`, `/run/podman/podman.sock`, then Docker Desktop / Colima / OrbStack / Rancher Desktop / Podman machine paths under `$HOME`); `liveSocket` resolves symlinks so one daemon is queried once, and containers are deduplicated by ID across sockets. Error classes: ECONNREFUSED/ENOENT = dead socket, skipped silently (Docker Desktop leaves one behind); EACCES/EPERM → `doctor.ErrPermission`; per-socket `containerTimeout` (2s) → "did not answer within"; the caller's context error always wins. A failure is returned only when no socket produced a container. Only `Id`, `Names`, `Image`, `Ports`, `Labels` are decoded — never `Command`. `Ports` entries without `PublicPort` are exposed-only and ignored; Docker lists a wildcard publish twice (`0.0.0.0` and `::`), Podman once; both fixtures live in `container_test.go`.
 
 ### Errors and exit codes
 
@@ -57,7 +63,7 @@ Exit codes (0 available, 1 in use, 2 cannot diagnose) are documented in README.m
 
 ### Output
 
-`presenter.Render` builds sections joined by blank lines and writes through `lipgloss.Fprint`, which strips ANSI when the writer is not a color terminal, so tests see plain text. Sections: headline, then per occupant Process + Network, Diagnosis, Suggestions, then Notes as bare dimmed lines. Labels are padded to 10 columns (`  %-10s%s`). If you change the format, update the golden strings in `presenter_test.go`, the assertions in `cli_test.go`, and the examples in README.md (its first screen is the product demo).
+`presenter.Render` builds sections joined by blank lines and writes through `lipgloss.Fprint`, which strips ANSI when the writer is not a color terminal, so tests see plain text. Sections: headline, then per occupant Process + Network, then per container a Container block (Runtime, Name, Image, Compose `project / service` when present, one `Mapping   host → containerport/tcp` line per mapping), Diagnosis, Suggestions, then Notes as bare dimmed lines. Labels are padded to 10 columns (`  %-10s%s`). If you change the format, update the golden strings in `presenter_test.go`, the assertions in `cli_test.go`, and the examples in README.md (its first screen is the product demo).
 
 ## Testing notes
 
@@ -65,6 +71,8 @@ Exit codes (0 available, 1 in use, 2 cannot diagnose) are documented in README.m
 - `TestRealLingeringSockets` closes a connection from the server side so the server socket sits in `TIME_WAIT` on the port; it polls briefly because the state transition is asynchronous.
 - `TestProcfsInspectProcessPermission` is skipped as root (root can read a mode-000 file), so it is skipped in the Docker run.
 
+- Container inspector tests serve fake runtimes with `net/http` on unix sockets. Socket paths come from `os.MkdirTemp("", "pd")`, not `t.TempDir()`: macOS caps a unix socket path at 104 bytes and the test-name-based temp dirs exceed it. The permission test `chmod 0`s the socket and is skipped as root. `TestRealContainer` (opt-in via `PORT_DOCTOR_CONTAINER_TEST=1`, run by `task test-container` and the `container` CI job on ubuntu's Docker Engine) starts `alpine:3 sleep 300` with `-p 80`, reads the host port from `docker port`, and checks both the inspector and a full `Diagnose`; on Docker Engine it is the only place the dual `0.0.0.0` + `[::]` mapping is exercised for real. On this machine `podman run` may fail on the gcloud credential helper in `~/.docker/config.json`; run it with `DOCKER_CONFIG` pointing at a directory holding an empty `config.json`.
+- `cli.TestEndToEnd` uses the real diagnoser, so it also queries whatever runtime socket exists; its assertions are substring-based and tolerate an extra container note.
 - Lint runs for both GOOS values (Taskfile and a CI matrix) because build-tagged files hide symbols from the other platform: a helper referenced only from `new_darwin.go` is "unused" on Linux.
 
 ## Code conventions
