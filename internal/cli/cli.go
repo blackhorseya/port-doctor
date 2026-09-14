@@ -38,13 +38,13 @@ type Diagnoser interface {
 // fakes for situations that are hard to stage for real, such as permission
 // failures.
 var newDiagnoser = func() (Diagnoser, error) {
-	ports, procs, err := inspect.New()
+	host, err := inspect.New()
 	if err != nil {
 		return nil, err
 	}
 	return &doctor.Doctor{
-		Ports:                  ports,
-		Processes:              procs,
+		Ports:                  host,
+		Processes:              host,
 		Containers:             inspect.NewContainerInspector(),
 		ElevatedInspectCommand: inspect.ElevatedInspectCommand,
 	}, nil

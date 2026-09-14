@@ -4,14 +4,11 @@ package inspect
 
 import (
 	"fmt"
-
-	"github.com/blackhorseya/port-doctor/internal/doctor"
 )
 
-// New returns the inspectors for Linux, backed by procfs.
-func New() (doctor.PortInspector, doctor.ProcessInspector, error) {
-	i := newProcfsInspector("/proc")
-	return i, i, nil
+// New returns the inspector for Linux, backed by procfs.
+func New() (HostInspector, error) {
+	return newProcfsInspector("/proc"), nil
 }
 
 // ElevatedInspectCommand returns a command that identifies the listener when

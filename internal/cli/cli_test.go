@@ -213,7 +213,7 @@ func TestAllowNegativeNumbers(t *testing.T) {
 // TestEndToEnd runs the real platform inspectors against a listener owned
 // by the test process itself.
 func TestEndToEnd(t *testing.T) {
-	if _, _, err := inspect.New(); err != nil {
+	if _, err := inspect.New(); err != nil {
 		t.Skip(err)
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

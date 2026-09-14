@@ -6,14 +6,11 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
-
-	"github.com/blackhorseya/port-doctor/internal/doctor"
 )
 
-// New returns the inspectors for macOS, backed by netstat and ps.
-func New() (doctor.PortInspector, doctor.ProcessInspector, error) {
-	i := newDarwinInspector(runCommand)
-	return i, i, nil
+// New returns the inspector for macOS, backed by netstat and ps.
+func New() (HostInspector, error) {
+	return newDarwinInspector(runCommand), nil
 }
 
 func runCommand(c context.Context, name string, args ...string) ([]byte, error) {

@@ -35,33 +35,59 @@ func newDarwinInspector(run commandRunner) *darwinInspector {
 
 // InspectPort implements doctor.PortInspector.
 func (i *darwinInspector) InspectPort(c context.Context, port int) (doctor.PortInfo, error) {
+	rows, err := i.netstat(c)
+	if err != nil {
+		return doctor.PortInfo{}, err
+	}
+	info := doctor.PortInfo{OtherSockets: map[string]int{}}
+	for _, row := range rows {
+		if int(row.addr.Port()) != port {
+			continue
+		}
+		if row.state != "LISTEN" {
+			info.OtherSockets[row.state]++
+			continue
+		}
+		info.Listeners = append(info.Listeners, rowListener(row))
+	}
+	return info, nil
+}
+
+// ListListeners implements doctor.ListenerInspector.
+func (i *darwinInspector) ListListeners(c context.Context) ([]doctor.Listener, error) {
+	rows, err := i.netstat(c)
+	if err != nil {
+		return nil, err
+	}
+	var out []doctor.Listener
+	for _, row := range rows {
+		if row.state == "LISTEN" {
+			out = append(out, rowListener(row))
+		}
+	}
+	return out, nil
+}
+
+// netstat lists every TCP socket on the host.
+func (i *darwinInspector) netstat(c context.Context) ([]netstatRow, error) {
 	out, err := i.run(c, "netstat", "-anv", "-p", "tcp")
 	if err != nil {
 		// A command killed by the deadline reports "signal: killed"; the
 		// context error is the one worth showing.
 		if cerr := c.Err(); cerr != nil {
-			return doctor.PortInfo{}, cerr
+			return nil, cerr
 		}
-		return doctor.PortInfo{}, describeCommandError("netstat", err)
+		return nil, describeCommandError("netstat", err)
 	}
-	rows, err := parseNetstat(bytes.NewReader(out), port)
+	rows, err := parseNetstat(bytes.NewReader(out))
 	if err != nil {
-		return doctor.PortInfo{}, fmt.Errorf("parse netstat output: %w", err)
+		return nil, fmt.Errorf("parse netstat output: %w", err)
 	}
+	return rows, nil
+}
 
-	info := doctor.PortInfo{OtherSockets: map[string]int{}}
-	for _, row := range rows {
-		if row.state != "LISTEN" {
-			info.OtherSockets[row.state]++
-			continue
-		}
-		info.Listeners = append(info.Listeners, doctor.Listener{
-			Protocol: doctor.ProtocolTCP,
-			Addr:     row.addr,
-			PID:      row.pid,
-		})
-	}
-	return info, nil
+func rowListener(row netstatRow) doctor.Listener {
+	return doctor.Listener{Protocol: doctor.ProtocolTCP, Addr: row.addr, PID: row.pid}
 }
 
 // InspectProcess implements doctor.ProcessInspector.
@@ -114,14 +140,14 @@ type netstatRow struct {
 	pid   int // 0 when the column is absent or unparsable
 }
 
-// parseNetstat returns the rows whose local port equals port.
+// parseNetstat returns every TCP socket in the output.
 //
 // The column layout of `netstat -anv` changes between macOS releases. Older
 // versions print a bare "pid" column; macOS 26 prints "process:pid", where the
 // process name may contain spaces. Both are handled by locating the pid column
 // in the header and counting the fixed columns that follow it, so rows are
 // read from the end where the layout is stable.
-func parseNetstat(r io.Reader, port int) ([]netstatRow, error) {
+func parseNetstat(r io.Reader) ([]netstatRow, error) {
 	var out []netstatRow
 	trailing := -1 // columns after the pid column, or -1 when unknown
 	sc := bufio.NewScanner(r)
@@ -138,7 +164,7 @@ func parseNetstat(r io.Reader, port int) ([]netstatRow, error) {
 			continue
 		}
 		addr, ok := parseNetstatAddr(fields[0], fields[3])
-		if !ok || int(addr.Port()) != port {
+		if !ok {
 			continue
 		}
 		row := netstatRow{addr: addr, state: fields[5]}
