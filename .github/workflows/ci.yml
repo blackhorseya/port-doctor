@@ -42,6 +42,18 @@ jobs:
         with:
           version: v2.13
 
+  container:
+    name: container (docker engine)
+    runs-on: ubuntu-latest # the runner ships a working dockerd
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./internal/inspect -run TestRealContainer -v
+        env:
+          PORT_DOCTOR_CONTAINER_TEST: "1"
+
   goreleaser:
     name: goreleaser check
     runs-on: ubuntu-latest
