@@ -17,7 +17,6 @@ task test-linux   # same suite inside a golang:1.27 container (Docker or Podman)
 task lint         # go vet + golangci-lint under GOOS=darwin and GOOS=linux (v2 config in .golangci.yml)
 task fmt          # gofmt + goimports via golangci-lint fmt
 task snapshot     # goreleaser release --snapshot --clean → ./dist
-task demo         # vhs docs/demo.tape → docs/demo.gif
 ```
 
 Single test: `go test ./internal/inspect -run TestParseNetstatModern -v`

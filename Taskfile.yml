@@ -52,11 +52,6 @@ tasks:
     cmds:
       - goreleaser release --snapshot --clean
 
-  demo:
-    desc: Record docs/demo.gif with vhs (brew install vhs)
-    cmds:
-      - vhs docs/demo.tape
-
   clean:
     desc: Remove build output
     cmds:
