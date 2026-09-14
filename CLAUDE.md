@@ -14,7 +14,7 @@ Dev commands use [Task](https://taskfile.dev) (`Taskfile.yml`); binaries go to `
 task build        # ./bin/port-doctor, version stamped from git describe
 task test         # go test -race ./...  (integration tests open real listeners on localhost)
 task test-linux   # same suite inside a golang:1.27 container (Docker or Podman)
-task lint         # go vet + golangci-lint (v2 config in .golangci.yml)
+task lint         # go vet + golangci-lint under GOOS=darwin and GOOS=linux (v2 config in .golangci.yml)
 task fmt          # gofmt + goimports via golangci-lint fmt
 task snapshot     # goreleaser release --snapshot --clean → ./dist
 task demo         # vhs docs/demo.tape → docs/demo.gif
@@ -65,6 +65,8 @@ Exit codes (0 available, 1 in use, 2 cannot diagnose) are documented in README.m
 - Integration tests (`internal/inspect/integration_test.go`, `cli.TestEndToEnd`) listen on ephemeral ports owned by the test process and assert the reported PID is `os.Getpid()`. They pin the network to `tcp4`/`tcp6`: plain `"tcp"` with a wildcard address makes Go open a dual-stack `[::]` socket even for `0.0.0.0`.
 - `TestRealLingeringSockets` closes a connection from the server side so the server socket sits in `TIME_WAIT` on the port; it polls briefly because the state transition is asynchronous.
 - `TestProcfsInspectProcessPermission` is skipped as root (root can read a mode-000 file), so it is skipped in the Docker run.
+
+- Lint runs for both GOOS values (Taskfile and a CI matrix) because build-tagged files hide symbols from the other platform: a helper referenced only from `new_darwin.go` is "unused" on Linux.
 
 ## Code conventions
 

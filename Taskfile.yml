@@ -31,10 +31,11 @@ tasks:
       - '{{.CONTAINER_RUNTIME}} run --rm -v "{{.ROOT_DIR}}:/src" -w /src -e GOFLAGS=-buildvcs=false golang:1.27 go test ./...'
 
   lint:
-    desc: Run go vet and golangci-lint
+    desc: Run go vet and golangci-lint for both supported platforms
     cmds:
       - go vet ./...
-      - golangci-lint run
+      - GOOS=darwin golangci-lint run
+      - GOOS=linux golangci-lint run
 
   fmt:
     desc: Format code with the configured formatters

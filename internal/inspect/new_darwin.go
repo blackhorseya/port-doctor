@@ -3,7 +3,9 @@
 package inspect
 
 import (
+	"context"
 	"fmt"
+	"os/exec"
 
 	"github.com/blackhorseya/port-doctor/internal/doctor"
 )
@@ -12,6 +14,10 @@ import (
 func New() (doctor.PortInspector, doctor.ProcessInspector, error) {
 	i := newDarwinInspector(runCommand)
 	return i, i, nil
+}
+
+func runCommand(c context.Context, name string, args ...string) ([]byte, error) {
+	return exec.CommandContext(c, name, args...).Output()
 }
 
 // ElevatedInspectCommand returns a command that identifies the listener when
