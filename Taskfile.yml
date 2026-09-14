@@ -1,0 +1,62 @@
+version: "3"
+
+vars:
+  BIN: bin/port-doctor
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo dev
+  LDFLAGS: -s -w -X main.version={{.VERSION}}
+  CONTAINER_RUNTIME:
+    sh: command -v docker || command -v podman || echo docker
+
+tasks:
+  default:
+    desc: List available tasks
+    silent: true
+    cmds:
+      - "{{.TASK_EXE}} --list"
+
+  build:
+    desc: Compile ./bin/port-doctor
+    cmds:
+      - go build -trimpath -ldflags "{{.LDFLAGS}}" -o {{.BIN}} ./cmd/port-doctor
+
+  test:
+    desc: Run unit and integration tests (integration tests open real listeners on localhost)
+    cmds:
+      - go test -race ./...
+
+  test-linux:
+    desc: Run the test suite inside a Linux container (needs Docker or Podman)
+    cmds:
+      - '{{.CONTAINER_RUNTIME}} run --rm -v "{{.ROOT_DIR}}:/src" -w /src -e GOFLAGS=-buildvcs=false golang:1.27 go test ./...'
+
+  lint:
+    desc: Run go vet and golangci-lint
+    cmds:
+      - go vet ./...
+      - golangci-lint run
+
+  fmt:
+    desc: Format code with the configured formatters
+    cmds:
+      - golangci-lint fmt
+
+  install:
+    desc: Install port-doctor into GOBIN
+    cmds:
+      - go install -trimpath -ldflags "{{.LDFLAGS}}" ./cmd/port-doctor
+
+  snapshot:
+    desc: Build release archives into ./dist without publishing
+    cmds:
+      - goreleaser release --snapshot --clean
+
+  demo:
+    desc: Record docs/demo.gif with vhs (brew install vhs)
+    cmds:
+      - vhs docs/demo.tape
+
+  clean:
+    desc: Remove build output
+    cmds:
+      - rm -rf bin dist
