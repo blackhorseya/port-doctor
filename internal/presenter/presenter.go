@@ -31,6 +31,9 @@ func Render(w io.Writer, r doctor.Report) error {
 		for _, occ := range r.Occupants {
 			sections = append(sections, process(occ), network(occ))
 		}
+		for _, ct := range r.Containers {
+			sections = append(sections, container(ct))
+		}
 		if r.Diagnosis != "" {
 			sections = append(sections, lines(headingStyle.Render("Diagnosis"), "  "+r.Diagnosis))
 		}
@@ -68,6 +71,29 @@ func network(occ doctor.Occupant) string {
 		out = append(out, field("Address", l.Addr.String()))
 	}
 	return lines(out...)
+}
+
+func container(ct doctor.Container) string {
+	out := []string{
+		headingStyle.Render("Container"),
+		field("Runtime", cmp.Or(ct.Runtime, unavailable())),
+		field("Name", cmp.Or(ct.Name, unavailable())),
+		field("Image", cmp.Or(ct.Image, unavailable())),
+	}
+	if ct.Compose.Project != "" {
+		out = append(out, field("Compose", composeText(ct.Compose)))
+	}
+	for _, m := range ct.Mappings {
+		out = append(out, field("Mapping", fmt.Sprintf("%s → %d/%s", m.Host, m.ContainerPort, strings.ToLower(string(m.Protocol)))))
+	}
+	return lines(out...)
+}
+
+func composeText(cs doctor.ComposeService) string {
+	if cs.Service == "" {
+		return cs.Project
+	}
+	return cs.Project + " / " + cs.Service
 }
 
 func pidText(occ doctor.Occupant) string {

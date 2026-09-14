@@ -21,6 +21,10 @@ func listener(addr string, pid int) doctor.Listener {
 	return doctor.Listener{Protocol: doctor.ProtocolTCP, Addr: netip.MustParseAddrPort(addr), PID: pid}
 }
 
+func mapping(host string, containerPort int) doctor.PortMapping {
+	return doctor.PortMapping{Host: netip.MustParseAddrPort(host), ContainerPort: containerPort, Protocol: doctor.ProtocolTCP}
+}
+
 func TestRenderAvailable(t *testing.T) {
 	got := render(t, doctor.Report{Port: 8080, Status: doctor.StatusAvailable})
 	want := "✓ Port 8080 is available\n"
@@ -178,6 +182,105 @@ Diagnosis
   Another process is listening on port 3000 (localhost only).
 
 Process 7 exited during inspection, so the port may be free now. Run port-doctor again to confirm.
+`
+	if got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestRenderContainer(t *testing.T) {
+	got := render(t, doctor.Report{
+		Port:   5432,
+		Status: doctor.StatusInUse,
+		Occupants: []doctor.Occupant{{
+			Process:   doctor.Process{PID: 3189, Name: "gvproxy", User: "sean"},
+			Listeners: []doctor.Listener{listener("[::]:5432", 3189)},
+		}},
+		Containers: []doctor.Container{{
+			Runtime:  "podman",
+			ID:       "5f9709733f64",
+			Name:     "demo-db-1",
+			Image:    "docker.io/library/postgres:17",
+			Mappings: []doctor.PortMapping{mapping("0.0.0.0:5432", 5432)},
+			Compose:  doctor.ComposeService{Project: "demo", Service: "db"},
+		}},
+		Diagnosis: "Container demo-db-1 (podman) publishes port 5432 (all interfaces).",
+		Suggestions: []doctor.Suggestion{
+			{Title: "Inspect", Commands: []string{"podman logs --tail 20 demo-db-1"}},
+			{Title: "Stop", Commands: []string{"podman compose -p demo stop db"}},
+		},
+	})
+	want := `✗ Port 5432 is in use
+
+Process
+  PID       3189
+  Name      gvproxy
+  User      sean
+
+Network
+  Protocol  TCP
+  Address   [::]:5432
+
+Container
+  Runtime   podman
+  Name      demo-db-1
+  Image     docker.io/library/postgres:17
+  Compose   demo / db
+  Mapping   0.0.0.0:5432 → 5432/tcp
+
+Diagnosis
+  Container demo-db-1 (podman) publishes port 5432 (all interfaces).
+
+Suggestions
+  Inspect:
+    podman logs --tail 20 demo-db-1
+
+  Stop:
+    podman compose -p demo stop db
+`
+	if got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestRenderContainerWithoutListener(t *testing.T) {
+	got := render(t, doctor.Report{
+		Port:   8080,
+		Status: doctor.StatusInUse,
+		Containers: []doctor.Container{{
+			Runtime:  "docker",
+			ID:       "1d0dc789506e",
+			Name:     "web",
+			Image:    "nginx:1.27",
+			Mappings: []doctor.PortMapping{mapping("0.0.0.0:8080", 80), mapping("[::]:8080", 80)},
+		}},
+		Diagnosis: "Container web (docker) publishes port 8080 (all interfaces); no host process is listening, so the runtime forwards the traffic itself.",
+		Suggestions: []doctor.Suggestion{
+			{Title: "Inspect", Commands: []string{"docker logs --tail 20 web"}},
+			{Title: "Stop", Commands: []string{"docker stop web"}},
+		},
+		Notes: []string{"Some containers may be missing: /run/podman/podman.sock: permission denied. Only a user with access to the runtime socket can see them."},
+	})
+	want := `✗ Port 8080 is in use
+
+Container
+  Runtime   docker
+  Name      web
+  Image     nginx:1.27
+  Mapping   0.0.0.0:8080 → 80/tcp
+  Mapping   [::]:8080 → 80/tcp
+
+Diagnosis
+  Container web (docker) publishes port 8080 (all interfaces); no host process is listening, so the runtime forwards the traffic itself.
+
+Suggestions
+  Inspect:
+    docker logs --tail 20 web
+
+  Stop:
+    docker stop web
+
+Some containers may be missing: /run/podman/podman.sock: permission denied. Only a user with access to the runtime socket can see them.
 `
 	if got != want {
 		t.Errorf("got:\n%s\nwant:\n%s", got, want)
