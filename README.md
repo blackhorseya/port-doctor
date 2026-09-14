@@ -65,6 +65,16 @@ $ port-doctor 3000
 ✓ Port 3000 is available
 ```
 
+```
+$ port-doctor scan
+
+PORT  BIND       PID    PROCESS     USER  CONTAINER
+3000  localhost  41022  node        sean
+5432  all        3189   gvproxy     sean  myapp-db-1 (podman)
+6379  all        -      -           -     redis-dev (docker)
+8080  all        18432  api-server  sean
+```
+
 `listen tcp :8080: bind: address already in use` usually means a detour
 through `lsof`, `ps`, `ss` or `netstat`, with different flags on every
 operating system. `port-doctor` answers the one question you actually have
@@ -72,7 +82,8 @@ operating system. `port-doctor` answers the one question you actually have
 the same output on both. When the port belongs to a Docker or Podman
 container it names the container, not the runtime's port forwarder, and
 suggests `docker stop` rather than a `kill` that would take every container
-offline.
+offline. `port-doctor scan` answers the same question for every port at
+once.
 
 ## Install
 
@@ -99,6 +110,7 @@ No root, no daemon, no configuration files, no telemetry.
 
 ```
 port-doctor <port>
+port-doctor scan
 port-doctor --version
 port-doctor --help
 ```
@@ -122,6 +134,35 @@ When several processes listen on the same port (for example one on
 For a free port that still has sockets in `TIME_WAIT` or another closing
 state, the port is reported as available with a note, because a new listener
 can fail to bind until those sockets expire.
+
+### Port overview
+
+`port-doctor scan` lists every TCP port with a listening socket, one line
+per port and process, sorted by port:
+
+- **PORT** and **BIND** — where it listens: `all` for a wildcard address,
+  `localhost` when every address is loopback, otherwise the address itself
+  (several are comma-separated). A process listening on both `0.0.0.0` and
+  `[::]` of one port takes one line; two different processes on one port
+  take two.
+- **PID**, **PROCESS**, **USER** — the process holding the socket. `-` means
+  it could not be identified (see [Permissions](#permissions)); `(exited)`
+  means it disappeared during the scan.
+- **CONTAINER** — the container publishing the port, as `name (runtime)`.
+  The process column still shows the real holder, typically the runtime's
+  port forwarder. A port a container publishes without any host listener
+  gets a line of its own with `-` in the process columns.
+
+The scan reads the local socket table and never connects to a port. It
+exits `0` once the listing is complete, even when nothing is listening, so
+it composes with other tools:
+
+```
+port-doctor scan | grep 8080
+```
+
+Notes about degraded results (a runtime socket that could not be reached,
+listeners that could not be attributed) follow the table.
 
 ### Containers
 
@@ -198,9 +239,9 @@ the tool.
 
 | Code | Meaning |
 |------|---------|
-| `0`  | The port is available |
+| `0`  | The port is available, or `scan` completed (even with nothing listening) |
 | `1`  | The port is in use — a process listens on it or a container publishes it |
-| `2`  | The diagnosis could not be performed — invalid arguments, unsupported platform, or a system utility failed |
+| `2`  | The diagnosis or scan could not be performed — invalid arguments, unsupported platform, or a system utility failed |
 
 This makes `port-doctor` usable in scripts:
 
@@ -241,6 +282,9 @@ Containers come from the runtime's own API — `GET /containers/json` on the
 Docker Engine or Podman socket, which answer identically — so no container
 CLI needs to be installed.
 
+`port-doctor scan` reads the same sources once and keeps every listening
+socket instead of one port's. Nothing is ever connected to or probed.
+
 Only TCP is diagnosed. Process command lines and environment variables are
 never shown, since they routinely contain secrets.
 
@@ -250,7 +294,8 @@ never shown, since they routinely contain secrets.
 - **v0.2 — Container awareness** ✓: ports published by Docker or Podman
   containers are attributed to the container, with `docker stop` /
   `podman stop` (or `compose stop`) in place of `kill`.
-- **v0.3 — Port overview**: `port-doctor scan` listing every local listener.
+- **v0.3 — Port overview** ✓: `port-doctor scan` lists every local
+  listener with its process and container.
 
 `port-doctor` stays focused on one question — what's using this port? — and
 will not grow into a general networking or security tool.
@@ -269,10 +314,10 @@ task lint
 
 Parsers for `/proc/net/tcp` and `netstat` output are pure functions with
 fixture tests that run on every platform; the integration tests exercise the
-real inspectors against sockets owned by the test process. The container
-inspector is tested against fake Docker and Podman runtimes served on unix
-sockets, and `task test-container` (also a CI job on Docker Engine) against
-a real one.
+real inspectors against sockets owned by the test process, for one port and
+for the whole scan. The container inspector is tested against fake Docker
+and Podman runtimes served on unix sockets, and `task test-container` (also
+a CI job on Docker Engine) against a real one.
 
 ## License
 
