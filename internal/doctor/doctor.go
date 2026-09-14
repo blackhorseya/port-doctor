@@ -95,8 +95,8 @@ type ComposeService struct {
 // ContainerInspector finds running containers that publish a host port.
 type ContainerInspector interface {
 	// PublishedContainers returns the running containers publishing port on
-	// this host. It returns nothing, and no error, when no container
-	// runtime is available.
+	// this host, with Mappings limited to that port. It returns nothing, and
+	// no error, when no container runtime is available.
 	PublishedContainers(c context.Context, port int) ([]Container, error)
 }
 
@@ -176,6 +176,12 @@ type Doctor struct {
 	// Containers finds containers publishing the port. Optional: nil skips
 	// container detection.
 	Containers ContainerInspector
+	// Listeners lists every listening socket for Scan. Diagnose does not
+	// use it.
+	Listeners ListenerInspector
+	// AllContainers lists every container's published ports for Scan.
+	// Optional: nil skips container detection.
+	AllContainers ContainerLister
 	// ElevatedInspectCommand returns a platform command that can identify a
 	// listener when normal privileges are not enough. Optional.
 	ElevatedInspectCommand func(port int) string
@@ -234,21 +240,36 @@ func (x *Doctor) publishedContainers(c context.Context, port int) ([]Container, 
 	}
 	cs, err := x.Containers.PublishedContainers(c, port)
 	var notes []string
-	if err != nil {
-		note := fmt.Sprintf("Containers were not checked: %v.", err)
-		if len(cs) > 0 {
-			note = fmt.Sprintf("Some containers may be missing: %v.", err)
-		}
-		if errors.Is(err, ErrPermission) {
-			note += " Only a user with access to the runtime socket can see them."
-		}
+	if note := containerNote(len(cs) > 0, err); note != "" {
 		notes = append(notes, note)
 	}
+	sortContainers(cs)
+	return cs, notes
+}
+
+// containerNote explains a failed container check. When the inspector still
+// returned some containers the failure means the list may be incomplete
+// rather than absent.
+func containerNote(some bool, err error) string {
+	if err == nil {
+		return ""
+	}
+	note := fmt.Sprintf("Containers were not checked: %v.", err)
+	if some {
+		note = fmt.Sprintf("Some containers may be missing: %v.", err)
+	}
+	if errors.Is(err, ErrPermission) {
+		note += " Only a user with access to the runtime socket can see them."
+	}
+	return note
+}
+
+// sortContainers orders containers by name and their mappings IPv4 first.
+func sortContainers(cs []Container) {
 	slices.SortFunc(cs, func(a, b Container) int { return cmp.Or(cmp.Compare(a.Name, b.Name), cmp.Compare(a.ID, b.ID)) })
 	for i := range cs {
 		slices.SortFunc(cs[i].Mappings, func(a, b PortMapping) int { return a.Host.Compare(b.Host) })
 	}
-	return cs, notes
 }
 
 const unidentifiedNote = "The listening process could not be identified, usually because it belongs to another user."
@@ -359,25 +380,38 @@ func mappingAddrs(ms []PortMapping) []netip.Addr {
 // scope summarises which interfaces the addresses cover, because
 // 127.0.0.1:8080 and 0.0.0.0:8080 mean very different things to a developer.
 func scope(addrs []netip.Addr) string {
-	loopback := true
-	ips := map[netip.Addr]bool{}
+	all, loopback, ips := summariseBind(addrs)
+	switch {
+	case all:
+		return " (all interfaces)"
+	case loopback:
+		return " (localhost only)"
+	case len(ips) == 1:
+		return fmt.Sprintf(" (%s only)", ips[0])
+	}
+	return ""
+}
+
+// summariseBind reduces bound addresses to what a summary needs: whether
+// any of them is a wildcard (all interfaces), whether all of them are
+// loopback, and otherwise the distinct addresses in order. IPv4-mapped IPv6
+// addresses are unmapped first so ::ffff:0.0.0.0 counts as a wildcard.
+func summariseBind(addrs []netip.Addr) (all, loopback bool, ips []netip.Addr) {
+	loopback = true
+	seen := map[netip.Addr]bool{}
 	for _, a := range addrs {
 		ip := a.Unmap()
 		if ip.IsUnspecified() {
-			return " (all interfaces)"
+			return true, false, nil
 		}
 		loopback = loopback && ip.IsLoopback()
-		ips[ip] = true
-	}
-	if loopback {
-		return " (localhost only)"
-	}
-	if len(ips) == 1 {
-		for ip := range ips {
-			return fmt.Sprintf(" (%s only)", ip)
+		if !seen[ip] {
+			seen[ip] = true
+			ips = append(ips, ip)
 		}
 	}
-	return ""
+	slices.SortFunc(ips, netip.Addr.Compare)
+	return false, loopback, ips
 }
 
 // runtimeForwarders are host processes that hold published ports on behalf

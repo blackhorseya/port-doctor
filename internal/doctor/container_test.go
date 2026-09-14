@@ -18,6 +18,10 @@ func (f fakeContainers) PublishedContainers(context.Context, int) ([]Container, 
 	return f.cs, f.err
 }
 
+func (f fakeContainers) ListContainers(context.Context) ([]Container, error) {
+	return f.cs, f.err
+}
+
 func mapping(host string, containerPort int) PortMapping {
 	return PortMapping{Host: netip.MustParseAddrPort(host), ContainerPort: containerPort, Protocol: ProtocolTCP}
 }
