@@ -17,12 +17,9 @@ import (
 )
 
 // commandRunner runs an external command and returns its stdout. It exists so
-// tests can feed canned output instead of executing anything.
+// tests can feed canned output instead of executing anything; the real one
+// lives in new_darwin.go so Linux builds carry no unused code.
 type commandRunner func(c context.Context, name string, args ...string) ([]byte, error)
-
-func runCommand(c context.Context, name string, args ...string) ([]byte, error) {
-	return exec.CommandContext(c, name, args...).Output()
-}
 
 // darwinInspector is the macOS implementation. It uses `netstat -anv`, which
 // reads the socket table through sysctl and therefore sees every user's
