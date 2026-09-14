@@ -30,9 +30,7 @@ checksum:
   name_template: checksums.txt
 
 changelog:
-  sort: asc
-  filters:
-    exclude:
-      - "^docs:"
-      - "^test:"
-      - "^chore:"
+  # Release notes come from GitHub's own generator, one line per merged PR.
+  # The git-based changelog listed every change twice because main only
+  # receives merge commits: once for the branch commit, once for the merge.
+  use: github-native
