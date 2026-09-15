@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 
@@ -36,13 +37,30 @@ tcp4       0      0  192.168.1.5.8080       *.*                    LISTEN      1
 tcp4       0      0  127.0.0.1.3000         *.*                    LISTEN      131072  131072    999      0 0x0000 0x00000106 000000000000d6f7 00000000 00000800      1      0 000000
 `
 
+// rows parses output and keeps the sockets on port.
 func rows(t *testing.T, output string, port int) []netstatRow {
 	t.Helper()
-	got, err := parseNetstat(strings.NewReader(output), port)
+	all, err := parseNetstat(strings.NewReader(output))
 	if err != nil {
 		t.Fatal(err)
 	}
+	var got []netstatRow
+	for _, r := range all {
+		if int(r.addr.Port()) == port {
+			got = append(got, r)
+		}
+	}
 	return got
+}
+
+func TestParseNetstatEveryRow(t *testing.T) {
+	all, err := parseNetstat(strings.NewReader(netstatModern))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 9 {
+		t.Errorf("rows = %d, want every socket in the fixture (9)", len(all))
+	}
 }
 
 func TestParseNetstatModern(t *testing.T) {
@@ -159,6 +177,51 @@ func TestDarwinInspectPort(t *testing.T) {
 	}
 }
 
+func TestDarwinListListeners(t *testing.T) {
+	r := &fakeRunner{outputs: map[string][]byte{"netstat": []byte(netstatModern)}}
+	got, err := newDarwinInspector(r.run).ListListeners(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []doctor.Listener{
+		{Protocol: doctor.ProtocolTCP, Addr: mustAddrPort("[::1]:48125"), PID: 25873},
+		{Protocol: doctor.ProtocolTCP, Addr: mustAddrPort("127.0.0.1:48124"), PID: 25873},
+		{Protocol: doctor.ProtocolTCP, Addr: mustAddrPort("[::]:48123"), PID: 25873},
+		{Protocol: doctor.ProtocolTCP, Addr: mustAddrPort("127.0.0.1:62243"), PID: 17120},
+		{Protocol: doctor.ProtocolTCP, Addr: mustAddrPort("[::]:53137"), PID: 645},
+		{Protocol: doctor.ProtocolTCP, Addr: mustAddrPort("[fe80::1%lo0]:48126"), PID: 25873},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("listeners = %+v, want %+v (LISTEN rows only)", got, want)
+	}
+	for n := range want {
+		if got[n] != want[n] {
+			t.Errorf("listener %d = %+v, want %+v", n, got[n], want[n])
+		}
+	}
+	if len(r.calls) != 1 || r.calls[0] != "netstat -anv -p tcp" {
+		t.Errorf("calls = %q, want one netstat", r.calls)
+	}
+
+	r = &fakeRunner{outputs: map[string][]byte{"netstat": []byte(netstatLegacy)}}
+	got, err = newDarwinInspector(r.run).ListListeners(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pids []int
+	for _, l := range got {
+		pids = append(pids, l.PID)
+	}
+	if want := []int{18432, 18432, 18500, 999}; !slices.Equal(pids, want) {
+		t.Errorf("legacy layout PIDs = %v, want %v", pids, want)
+	}
+
+	r = &fakeRunner{errs: map[string]error{"netstat": exec.ErrNotFound}}
+	if _, err := newDarwinInspector(r.run).ListListeners(t.Context()); err == nil || !strings.Contains(err.Error(), "netstat is not installed") {
+		t.Errorf("missing netstat: %v", err)
+	}
+}
+
 func TestDarwinInspectPortErrors(t *testing.T) {
 	r := &fakeRunner{errs: map[string]error{"netstat": exec.ErrNotFound}}
 	_, err := newDarwinInspector(r.run).InspectPort(t.Context(), 1)
@@ -187,6 +250,9 @@ func TestDarwinContextErrorWins(t *testing.T) {
 	}
 	if _, err := i.InspectProcess(c, 1); !errors.Is(err, context.Canceled) {
 		t.Errorf("InspectProcess error = %v, want context.Canceled", err)
+	}
+	if _, err := i.ListListeners(c); !errors.Is(err, context.Canceled) {
+		t.Errorf("ListListeners error = %v, want context.Canceled", err)
 	}
 }
 

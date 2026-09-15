@@ -37,56 +37,93 @@ func newProcfsInspector(root string) *procfsInspector {
 
 // InspectPort implements doctor.PortInspector.
 func (i *procfsInspector) InspectPort(_ context.Context, port int) (doctor.PortInfo, error) {
+	socks, err := i.sockets()
+	if err != nil {
+		return doctor.PortInfo{}, err
+	}
 	info := doctor.PortInfo{OtherSockets: map[string]int{}}
 	var listeners []procSocket
+	for _, s := range socks {
+		if int(s.addr.Port()) != port {
+			continue
+		}
+		if s.state == "LISTEN" {
+			listeners = append(listeners, s)
+		} else {
+			info.OtherSockets[s.state]++
+		}
+	}
+	info.Listeners = i.attribute(listeners)
+	return info, nil
+}
+
+// ListListeners implements doctor.ListenerInspector.
+func (i *procfsInspector) ListListeners(_ context.Context) ([]doctor.Listener, error) {
+	socks, err := i.sockets()
+	if err != nil {
+		return nil, err
+	}
+	var listeners []procSocket
+	for _, s := range socks {
+		if s.state == "LISTEN" {
+			listeners = append(listeners, s)
+		}
+	}
+	return i.attribute(listeners), nil
+}
+
+// sockets reads every TCP socket of both address families. A missing tcp6
+// table means IPv6 is disabled and is not an error; both missing is.
+func (i *procfsInspector) sockets() ([]procSocket, error) {
+	var out []procSocket
 	opened := 0
 	for _, name := range []string{"net/tcp", "net/tcp6"} {
-		socks, err := i.readSockets(name, port)
+		socks, err := i.readSockets(name)
 		if errors.Is(err, fs.ErrNotExist) {
-			continue // IPv6 can be disabled entirely.
+			continue
 		}
 		if err != nil {
-			return doctor.PortInfo{}, err
+			return nil, err
 		}
 		opened++
-		for _, s := range socks {
-			if s.state == "LISTEN" {
-				listeners = append(listeners, s)
-			} else {
-				info.OtherSockets[s.state]++
-			}
-		}
+		out = append(out, socks...)
 	}
 	if opened == 0 {
-		return doctor.PortInfo{}, fmt.Errorf("read %s/net/tcp: %w", i.root, fs.ErrNotExist)
+		return nil, fmt.Errorf("read %s/net/tcp: %w", i.root, fs.ErrNotExist)
 	}
-	if len(listeners) == 0 {
-		return info, nil
-	}
+	return out, nil
+}
 
+// attribute maps listening sockets to their owning PIDs with one walk of
+// /proc and converts them for the doctor. Nil when there are none.
+func (i *procfsInspector) attribute(listeners []procSocket) []doctor.Listener {
+	if len(listeners) == 0 {
+		return nil
+	}
 	wanted := map[uint64]bool{}
 	for _, s := range listeners {
 		wanted[s.inode] = true
 	}
 	owners := i.socketOwners(wanted)
+	out := make([]doctor.Listener, 0, len(listeners))
 	for _, s := range listeners {
-		info.Listeners = append(info.Listeners, doctor.Listener{
+		out = append(out, doctor.Listener{
 			Protocol: doctor.ProtocolTCP,
 			Addr:     s.addr,
 			PID:      owners[s.inode],
 			User:     lookupUser(s.uid),
 		})
 	}
-	return info, nil
+	return out
 }
 
-func (i *procfsInspector) readSockets(name string, port int) ([]procSocket, error) {
+func (i *procfsInspector) readSockets(name string) ([]procSocket, error) {
 	f, err := os.Open(filepath.Join(i.root, name))
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", name, err)
 	}
 	defer func() { _ = f.Close() }()
-	socks, err := parseProcNetTCP(f, port)
+	socks, err := parseProcNetTCP(f)
 	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", name, err)
 	}
@@ -235,12 +272,12 @@ var tcpStates = map[string]string{
 	"0C": "NEW_SYN_RECV",
 }
 
-// parseProcNetTCP returns the sockets whose local port equals port.
+// parseProcNetTCP returns every socket in the table.
 //
 // Row layout (header omitted):
 //
 //	sl local_address rem_address st tx_queue:rx_queue tr:tm->when retrnsmt uid timeout inode ...
-func parseProcNetTCP(r io.Reader, port int) ([]procSocket, error) {
+func parseProcNetTCP(r io.Reader) ([]procSocket, error) {
 	var out []procSocket
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
@@ -251,9 +288,6 @@ func parseProcNetTCP(r io.Reader, port int) ([]procSocket, error) {
 		addr, err := decodeProcAddr(fields[1])
 		if err != nil {
 			return nil, fmt.Errorf("local address %q: %w", fields[1], err)
-		}
-		if int(addr.Port()) != port {
-			continue
 		}
 		uid, err := strconv.Atoi(fields[7])
 		if err != nil {

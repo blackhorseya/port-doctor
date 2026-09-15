@@ -59,14 +59,35 @@ func TestRealContainer(t *testing.T) {
 		}
 	}
 
+	// The host-wide listing carries the same container with the same mapping.
+	all, err := NewContainerInspector().ListContainers(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := false
+	for _, c := range all {
+		if c.Name != name {
+			continue
+		}
+		listed = true
+		for _, m := range c.Mappings {
+			if int(m.Host.Port()) != port {
+				t.Errorf("ListContainers mapping = %+v, want host port %d", m, port)
+			}
+		}
+	}
+	if !listed {
+		t.Errorf("ListContainers = %+v, lacks %s", all, name)
+	}
+
 	// The whole doctor: in use, attributed to the container, and never a
 	// kill for the runtime's port forwarder (or for nothing, when the
 	// runtime publishes with packet rules and no host listener exists).
-	ports, procs, err := New()
+	host, err := New()
 	if err != nil {
 		t.Skip(err)
 	}
-	x := &doctor.Doctor{Ports: ports, Processes: procs, Containers: NewContainerInspector(), ElevatedInspectCommand: ElevatedInspectCommand}
+	x := &doctor.Doctor{Ports: host, Processes: host, Containers: NewContainerInspector(), ElevatedInspectCommand: ElevatedInspectCommand}
 	r, err := x.Diagnose(t.Context(), port)
 	if err != nil {
 		t.Fatal(err)

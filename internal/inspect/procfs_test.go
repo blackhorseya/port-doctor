@@ -54,11 +54,32 @@ func TestDecodeProcAddr(t *testing.T) {
 	}
 }
 
-func TestParseProcNetTCP(t *testing.T) {
-	socks, err := parseProcNetTCP(strings.NewReader(procNetTCP), 8080)
+// procSocketsOn parses table and keeps the sockets on port.
+func procSocketsOn(t *testing.T, table string, port int) []procSocket {
+	t.Helper()
+	all, err := parseProcNetTCP(strings.NewReader(table))
 	if err != nil {
 		t.Fatal(err)
 	}
+	var out []procSocket
+	for _, s := range all {
+		if int(s.addr.Port()) == port {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func TestParseProcNetTCP(t *testing.T) {
+	all, err := parseProcNetTCP(strings.NewReader(procNetTCP))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 5 {
+		t.Errorf("rows = %d, want every socket in the fixture (5)", len(all))
+	}
+
+	socks := procSocketsOn(t, procNetTCP, 8080)
 	want := []procSocket{
 		{addr: mustAddrPort("127.0.0.1:8080"), state: "LISTEN", uid: 1000, inode: 12345},
 		{addr: mustAddrPort("127.0.0.1:8080"), state: "ESTABLISHED", uid: 1000, inode: 12346},
@@ -73,12 +94,43 @@ func TestParseProcNetTCP(t *testing.T) {
 		}
 	}
 
-	socks, err = parseProcNetTCP(strings.NewReader(procNetTCP), 3000)
-	if err != nil || len(socks) != 1 || socks[0].addr.String() != "0.0.0.0:3000" {
-		t.Errorf("port 3000: %+v, %v", socks, err)
+	if socks = procSocketsOn(t, procNetTCP, 3000); len(socks) != 1 || socks[0].addr.String() != "0.0.0.0:3000" {
+		t.Errorf("port 3000: %+v", socks)
 	}
-	if _, err := parseProcNetTCP(strings.NewReader("   0: BROKEN:1F90 x x 0A x x x 1000 0 1\n"), 8080); err == nil {
+	if _, err := parseProcNetTCP(strings.NewReader("   0: BROKEN:1F90 x x 0A x x x 1000 0 1\n")); err == nil {
 		t.Error("corrupt row should be an error")
+	}
+}
+
+func TestProcfsListListeners(t *testing.T) {
+	f := newFakeProc(t)
+	f.process("100", "api-server", 1000, "/opt/app/bin/api-server-linux-amd64")
+	f.link("100/fd/3", "socket:[12345]")
+	f.link("1/fd/7", "socket:[777]") // socket activation: PID 1 also holds it
+	f.link("900/fd/2", "socket:[777]")
+	// inodes 12348 and 778 belong to nobody readable
+
+	got, err := newProcfsInspector(f.root).ListListeners(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []doctor.Listener{
+		{Protocol: doctor.ProtocolTCP, Addr: mustAddrPort("127.0.0.1:8080"), PID: 100, User: lookupUser(1000)},
+		{Protocol: doctor.ProtocolTCP, Addr: mustAddrPort("0.0.0.0:3000"), PID: 0, User: lookupUser(1000)},
+		{Protocol: doctor.ProtocolTCP, Addr: mustAddrPort("[::]:8080"), PID: 900, User: lookupUser(0)},
+		{Protocol: doctor.ProtocolTCP, Addr: mustAddrPort("[::1]:3000"), PID: 0, User: lookupUser(1000)},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("listeners = %+v, want %+v (LISTEN rows of both tables)", got, want)
+	}
+	for n := range want {
+		if got[n] != want[n] {
+			t.Errorf("listener %d = %+v, want %+v", n, got[n], want[n])
+		}
+	}
+
+	if _, err := newProcfsInspector(t.TempDir()).ListListeners(t.Context()); err == nil {
+		t.Error("no socket tables at all should be an error")
 	}
 }
 

@@ -17,13 +17,13 @@ import (
 // These tests run the real platform inspectors against sockets owned by the
 // test process. They are skipped on unsupported platforms.
 
-func inspectors(t *testing.T) (doctor.PortInspector, doctor.ProcessInspector) {
+func inspectors(t *testing.T) HostInspector {
 	t.Helper()
-	ports, procs, err := New()
+	host, err := New()
 	if err != nil {
 		t.Skip(err)
 	}
-	return ports, procs
+	return host
 }
 
 func mustAddrPort(s string) netip.AddrPort {
@@ -40,7 +40,7 @@ func currentUser(t *testing.T) string {
 }
 
 func TestRealListeners(t *testing.T) {
-	ports, _ := inspectors(t)
+	ports := inspectors(t)
 	me := currentUser(t)
 
 	// The network is pinned to tcp4/tcp6 because plain "tcp" with a wildcard
@@ -87,8 +87,37 @@ func TestRealListeners(t *testing.T) {
 	}
 }
 
+// TestRealListListeners checks that the host-wide listing contains the
+// test process's own listener with its PID, among whatever else is open.
+func TestRealListListeners(t *testing.T) {
+	host := inspectors(t)
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	ls, err := host.ListListeners(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mine []doctor.Listener
+	for _, l := range ls {
+		if l.Protocol != doctor.ProtocolTCP || l.Addr.Port() == 0 {
+			t.Errorf("listener = %+v", l)
+		}
+		if int(l.Addr.Port()) == port {
+			mine = append(mine, l)
+		}
+	}
+	if len(mine) != 1 || mine[0].PID != os.Getpid() || mine[0].Addr.Addr() != netip.MustParseAddr("127.0.0.1") {
+		t.Errorf("own listener on port %d = %+v, want exactly one with PID %d", port, mine, os.Getpid())
+	}
+}
+
 func TestRealProcess(t *testing.T) {
-	_, procs := inspectors(t)
+	procs := inspectors(t)
 
 	p, err := procs.InspectProcess(t.Context(), os.Getpid())
 	if err != nil {
@@ -124,7 +153,7 @@ func TestRealProcess(t *testing.T) {
 // TestRealLingeringSockets closes a connection from the server side so the
 // server's socket sits in TIME_WAIT on the port after the listener is gone.
 func TestRealLingeringSockets(t *testing.T) {
-	ports, _ := inspectors(t)
+	ports := inspectors(t)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

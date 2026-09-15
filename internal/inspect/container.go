@@ -43,8 +43,8 @@ type containerInspector struct {
 
 // NewContainerInspector returns an inspector for the container runtime
 // sockets that may exist on this machine. Nothing is contacted until
-// PublishedContainers is called.
-func NewContainerInspector() doctor.ContainerInspector {
+// PublishedContainers or ListContainers is called.
+func NewContainerInspector() RuntimeInspector {
 	home, _ := os.UserHomeDir()
 	return &containerInspector{sockets: containerSockets(os.Getenv, home), timeout: containerTimeout}
 }
@@ -81,12 +81,23 @@ func containerSockets(getenv func(string) string, home string) []string {
 	return out
 }
 
-// PublishedContainers queries each live socket and merges the answers,
-// deduplicated by container ID because several paths often lead to the same
-// daemon. A socket that fails is skipped; its error is returned only when no
-// socket produced a container, so a broken second runtime never hides the
-// containers of a working one.
+// PublishedContainers implements doctor.ContainerInspector.
 func (i *containerInspector) PublishedContainers(c context.Context, port int) ([]doctor.Container, error) {
+	all, err := i.collect(c)
+	return settle(c, onPort(all, port), err)
+}
+
+// ListContainers implements doctor.ContainerLister.
+func (i *containerInspector) ListContainers(c context.Context) ([]doctor.Container, error) {
+	all, err := i.collect(c)
+	return settle(c, all, err)
+}
+
+// collect queries each live socket and merges the answers, deduplicated by
+// container ID because several paths often lead to the same daemon. It
+// returns everything found together with the first socket failure, if any;
+// settle decides whether that failure matters.
+func (i *containerInspector) collect(c context.Context) ([]doctor.Container, error) {
 	var found []doctor.Container
 	seen := map[string]bool{}
 	tried := map[string]bool{}
@@ -99,7 +110,7 @@ func (i *containerInspector) PublishedContainers(c context.Context, port int) ([
 		if !ok {
 			continue
 		}
-		cs, err := i.query(c, path, port)
+		cs, err := i.query(c, path)
 		switch {
 		case errors.Is(err, errDeadSocket):
 			continue
@@ -117,10 +128,40 @@ func (i *containerInspector) PublishedContainers(c context.Context, port int) ([
 			}
 		}
 	}
+	return found, firstErr
+}
+
+// settle applies the reporting rule shared by both methods: the caller's
+// context error always surfaces, with whatever was found so far; a socket
+// failure surfaces only when nothing was found, so a broken second runtime
+// never hides the containers of a working one.
+func settle(c context.Context, found []doctor.Container, err error) ([]doctor.Container, error) {
+	if cerr := c.Err(); cerr != nil {
+		return found, cerr
+	}
 	if len(found) == 0 {
-		return nil, firstErr
+		return nil, err
 	}
 	return found, nil
+}
+
+// onPort keeps the containers publishing port, with only that port's mappings.
+func onPort(cs []doctor.Container, port int) []doctor.Container {
+	var out []doctor.Container
+	for _, ct := range cs {
+		var ms []doctor.PortMapping
+		for _, m := range ct.Mappings {
+			if int(m.Host.Port()) == port {
+				ms = append(ms, m)
+			}
+		}
+		if len(ms) == 0 {
+			continue
+		}
+		ct.Mappings = ms
+		out = append(out, ct)
+	}
+	return out
 }
 
 func cmpErr(first, next error) error {
@@ -146,8 +187,8 @@ func liveSocket(path string, tried map[string]bool) (string, bool) {
 }
 
 // query lists the running containers of one runtime and keeps those that
-// publish port. The Server header tells Docker Engine and Podman apart.
-func (i *containerInspector) query(parent context.Context, path string, port int) ([]doctor.Container, error) {
+// publish a TCP port. The Server header tells Docker Engine and Podman apart.
+func (i *containerInspector) query(parent context.Context, path string) ([]doctor.Container, error) {
 	c, cancel := context.WithTimeout(parent, i.timeout)
 	defer cancel()
 
@@ -181,7 +222,7 @@ func (i *containerInspector) query(parent context.Context, path string, port int
 	if err := json.Unmarshal(body, &list); err != nil {
 		return nil, fmt.Errorf("%s answered with something other than a container list", path)
 	}
-	return publishedOn(list, port, runtimeName(resp.Header.Get("Server"))), nil
+	return toContainers(list, runtimeName(resp.Header.Get("Server"))), nil
 }
 
 // classify turns a transport failure into the error the doctor should see:
@@ -233,12 +274,15 @@ func runtimeName(server string) string {
 	return "docker"
 }
 
-func publishedOn(list []apiContainer, port int, runtime string) []doctor.Container {
+// toContainers converts the runtime's answer, keeping the containers that
+// publish at least one TCP port together with all of their TCP mappings.
+// Exposed-only ports (no PublicPort) and UDP publications are dropped.
+func toContainers(list []apiContainer, runtime string) []doctor.Container {
 	var out []doctor.Container
 	for _, ac := range list {
 		var mappings []doctor.PortMapping
 		for _, p := range ac.Ports {
-			if p.PublicPort != port || !strings.EqualFold(p.Type, "tcp") {
+			if p.PublicPort < 1 || p.PublicPort > 65535 || !strings.EqualFold(p.Type, "tcp") {
 				continue
 			}
 			ip, err := netip.ParseAddr(p.IP)
@@ -246,7 +290,7 @@ func publishedOn(list []apiContainer, port int, runtime string) []doctor.Contain
 				ip = netip.IPv4Unspecified()
 			}
 			mappings = append(mappings, doctor.PortMapping{
-				Host:          netip.AddrPortFrom(ip, uint16(port)),
+				Host:          netip.AddrPortFrom(ip, uint16(p.PublicPort)),
 				ContainerPort: p.PrivatePort,
 				Protocol:      doctor.ProtocolTCP,
 			})

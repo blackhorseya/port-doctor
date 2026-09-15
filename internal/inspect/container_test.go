@@ -298,11 +298,72 @@ func TestPublishedContainersMalformedAnswer(t *testing.T) {
 	}
 }
 
-func TestPublishedOnUnparsableIP(t *testing.T) {
+func TestToContainersUnparsableIP(t *testing.T) {
 	list := []apiContainer{{ID: "abc", Names: []string{"/x"}, Ports: []apiPort{{IP: "", PublicPort: 80, PrivatePort: 80, Type: "tcp"}}}}
-	cs := publishedOn(list, 80, "docker")
+	cs := toContainers(list, "docker")
 	if len(cs) != 1 || cs[0].Mappings[0].Host.String() != "0.0.0.0:80" {
 		t.Errorf("containers = %+v, want the wildcard assumed", cs)
+	}
+
+	list = []apiContainer{{ID: "abc", Names: []string{"/x"}, Ports: []apiPort{{IP: "0.0.0.0", PublicPort: 70000, PrivatePort: 80, Type: "tcp"}}}}
+	if cs := toContainers(list, "docker"); len(cs) != 0 {
+		t.Errorf("containers = %+v, want an impossible port dropped", cs)
+	}
+}
+
+func TestListContainers(t *testing.T) {
+	d := serveRuntime(t, "Docker/27.3.1 (linux)", http.StatusOK, dockerList)
+	p := serveRuntime(t, "Libpod/5.8.1 (linux)", http.StatusOK, podmanList)
+
+	cs, err := newInspector(d.path, p.path).ListContainers(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cs) != 3 {
+		t.Fatalf("containers = %+v, want the three publishing containers", cs)
+	}
+	byName := map[string]doctor.Container{}
+	for _, ct := range cs {
+		byName[ct.Name] = ct
+	}
+	if got := hosts(byName["demo-db-1"]); !slices.Equal(got, []string{"0.0.0.0:5432", "[::]:5432"}) {
+		t.Errorf("demo-db-1 hosts = %v", got)
+	}
+	// The exposed-only 443 and the UDP publication are dropped; only the
+	// localhost 8080 remains.
+	if got := hosts(byName["web"]); !slices.Equal(got, []string{"127.0.0.1:8080"}) {
+		t.Errorf("web hosts = %v", got)
+	}
+	if got := hosts(byName["pd-probe-a"]); !slices.Equal(got, []string{"0.0.0.0:15379"}) || byName["pd-probe-a"].Runtime != "podman" {
+		t.Errorf("pd-probe-a = %+v", byName["pd-probe-a"])
+	}
+
+	if cs, err := newInspector(filepath.Join(filepath.Dir(d.path), "nope.sock")).ListContainers(t.Context()); err != nil || cs != nil {
+		t.Errorf("no runtime: containers = %+v, err = %v; want nothing and no error", cs, err)
+	}
+}
+
+// A broken runtime next to a working one: the failure is reported only when
+// nothing was found, which for a single port means "nothing on that port",
+// not "nothing at all".
+func TestListContainersBrokenRuntimeContract(t *testing.T) {
+	broken := serveRuntime(t, "Docker/27.3.1 (linux)", http.StatusInternalServerError, "")
+	ok := serveRuntime(t, "Libpod/5.8.1 (linux)", http.StatusOK, podmanList)
+	i := newInspector(broken.path, ok.path)
+
+	cs, err := i.ListContainers(t.Context())
+	if err != nil || len(cs) != 1 {
+		t.Errorf("ListContainers = %+v, err = %v; want the working runtime's container and no error", cs, err)
+	}
+	cs, err = i.PublishedContainers(t.Context(), 9999)
+	if err == nil || !strings.Contains(err.Error(), broken.path+" answered HTTP 500") || cs != nil {
+		t.Errorf("PublishedContainers(9999) = %+v, err = %v; want the failure, since nothing matched the port", cs, err)
+	}
+
+	c, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := i.ListContainers(c); !errors.Is(err, context.Canceled) {
+		t.Errorf("ListContainers error = %v, want context.Canceled", err)
 	}
 }
 
