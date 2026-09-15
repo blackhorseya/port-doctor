@@ -20,18 +20,19 @@ import (
 
 // Exit codes, as documented in the README.
 const (
-	exitAvailable = 0 // nothing is listening on the port and no container publishes it
+	exitAvailable = 0 // nothing is listening on the port and no container publishes it; also a completed scan
 	exitInUse     = 1 // a process is listening on the port or a container publishes it
-	exitError     = 2 // the diagnosis could not be performed
+	exitError     = 2 // the diagnosis or scan could not be performed
 )
 
 // inspectTimeout bounds the system utilities and procfs walks so a wedged
 // tool cannot hang port-doctor. A variable so tests can shrink it.
 var inspectTimeout = 15 * time.Second
 
-// Diagnoser is the one thing the command needs from the rest of the program.
+// Diagnoser is the one thing the commands need from the rest of the program.
 type Diagnoser interface {
 	Diagnose(c context.Context, port int) (doctor.Report, error)
+	Scan(c context.Context) (doctor.Overview, error)
 }
 
 // newDiagnoser builds the platform doctor. A variable so tests can swap in
@@ -42,10 +43,13 @@ var newDiagnoser = func() (Diagnoser, error) {
 	if err != nil {
 		return nil, err
 	}
+	containers := inspect.NewContainerInspector()
 	return &doctor.Doctor{
 		Ports:                  host,
 		Processes:              host,
-		Containers:             inspect.NewContainerInspector(),
+		Listeners:              host,
+		Containers:             containers,
+		AllContainers:          containers,
 		ElevatedInspectCommand: inspect.ElevatedInspectCommand,
 	}, nil
 }
@@ -53,18 +57,15 @@ var newDiagnoser = func() (Diagnoser, error) {
 // Run executes port-doctor with args (excluding the program name) and
 // returns the process exit code.
 func Run(c context.Context, version string, args []string, stdout, stderr io.Writer) int {
-	var report doctor.Report
-	cmd := newCommand(version, &report)
+	code := exitAvailable
+	cmd := newCommand(version, &code)
 	cmd.SetArgs(allowNegativeNumbers(args))
 	cmd.SetOut(stdout)
 	cmd.SetErr(stderr)
 
 	err := cmd.ExecuteContext(c)
 	if err == nil {
-		if report.Status == doctor.StatusInUse {
-			return exitInUse
-		}
-		return exitAvailable
+		return code
 	}
 
 	// Nothing useful can be done if stderr itself is broken.
@@ -75,7 +76,10 @@ func Run(c context.Context, version string, args []string, stdout, stderr io.Wri
 	return exitError
 }
 
-func newCommand(version string, report *doctor.Report) *cobra.Command {
+// newCommand builds the root command and its scan subcommand. A command
+// that completes writes its exit code to code; a failure is returned as an
+// error and mapped to exitError by Run.
+func newCommand(version string, code *int) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "port-doctor <port>",
 		Short: "Find out what is using a local TCP port",
@@ -84,21 +88,40 @@ func newCommand(version string, report *doctor.Report) *cobra.Command {
 			"owner, the address it is bound to, and suggests what to do next.\n" +
 			"When a Docker or Podman container publishes the port, it names the\n" +
 			"container instead of the runtime's port forwarder.\n" +
+			"\"port-doctor scan\" lists every listening port the same way.\n" +
 			"It never stops or modifies anything itself.",
 		Example: "  port-doctor 8080\n" +
-			"  port-doctor 5432",
+			"  port-doctor 5432\n" +
+			"  port-doctor scan",
 		Version:           resolveVersion(version),
 		Args:              onePort,
 		SilenceUsage:      true,
 		SilenceErrors:     true,
 		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return diagnose(cmd.Context(), args[0], report, cmd.OutOrStdout())
+			return diagnose(cmd.Context(), args[0], code, cmd.OutOrStdout())
 		},
 	}
 	cmd.SetVersionTemplate("port-doctor {{.Version}}\n")
 	cmd.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
 		return &usageError{err: err}
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "scan",
+		Short: "List every listening TCP port",
+		Long: "port-doctor scan lists every TCP port with a listening socket on this\n" +
+			"machine, one line per port and process: the interfaces it is bound to,\n" +
+			"the PID, name and owner of the process holding it, and the Docker or\n" +
+			"Podman container publishing it. It reads the local socket table and\n" +
+			"never connects to a port.",
+		Example: "  port-doctor scan\n" +
+			"  port-doctor scan | grep 8080",
+		Args:          noArgs,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return scan(cmd.Context(), cmd.OutOrStdout())
+		},
 	})
 	return cmd
 }
@@ -114,9 +137,16 @@ func onePort(_ *cobra.Command, args []string) error {
 	}
 }
 
+func noArgs(_ *cobra.Command, args []string) error {
+	if len(args) > 0 {
+		return &usageError{err: fmt.Errorf("scan takes no arguments, got %d", len(args))}
+	}
+	return nil
+}
+
 // diagnose validates arg, runs the platform doctor on it and renders the
-// result to w, storing the report so Run can pick the exit code.
-func diagnose(c context.Context, arg string, report *doctor.Report, w io.Writer) error {
+// result to w, setting code to exitInUse when the port is taken.
+func diagnose(c context.Context, arg string, code *int, w io.Writer) error {
 	port, err := doctor.ParsePort(arg)
 	if err != nil {
 		return &usageError{err: err}
@@ -130,13 +160,38 @@ func diagnose(c context.Context, arg string, report *doctor.Report, w io.Writer)
 	defer cancel()
 	r, err := d.Diagnose(c, port)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("inspection timed out after %s", inspectTimeout)
-		}
+		return describe(err)
+	}
+	if r.Status == doctor.StatusInUse {
+		*code = exitInUse
+	}
+	return presenter.Render(w, r)
+}
+
+// scan lists every listening port and renders the overview to w. A
+// completed scan always exits 0, even when nothing is listening.
+func scan(c context.Context, w io.Writer) error {
+	d, err := newDiagnoser()
+	if err != nil {
 		return err
 	}
-	*report = r
-	return presenter.Render(w, r)
+
+	c, cancel := context.WithTimeout(c, inspectTimeout)
+	defer cancel()
+	o, err := d.Scan(c)
+	if err != nil {
+		return describe(err)
+	}
+	return presenter.RenderOverview(w, o)
+}
+
+// describe replaces the bare deadline error with one that says how long
+// port-doctor waited.
+func describe(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("inspection timed out after %s", inspectTimeout)
+	}
+	return err
 }
 
 // allowNegativeNumbers stops the flag parser from reading "-1" as the flag
@@ -161,7 +216,7 @@ func allowNegativeNumbers(args []string) []string {
 // to add beyond the error message itself.
 func hint(err error) string {
 	if _, ok := errors.AsType[*usageError](err); ok {
-		return "usage: port-doctor <port>, for example: port-doctor 8080"
+		return "usage: port-doctor <port> or port-doctor scan, for example: port-doctor 8080"
 	}
 	if errors.Is(err, inspect.ErrUnsupportedPlatform) {
 		return "port-doctor diagnoses ports on macOS and Linux only"

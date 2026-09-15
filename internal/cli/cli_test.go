@@ -32,9 +32,11 @@ func run(t *testing.T, args ...string) result {
 // fakeDoctor stands in for the platform doctor so exit codes and messages
 // can be pinned without staging real sockets.
 type fakeDoctor struct {
-	report doctor.Report
-	err    error
-	block  bool // wait for the context to expire, then return its error
+	report   doctor.Report
+	err      error
+	overview doctor.Overview
+	scanErr  error
+	block    bool // wait for the context to expire, then return its error
 }
 
 func (f fakeDoctor) Diagnose(c context.Context, port int) (doctor.Report, error) {
@@ -45,6 +47,26 @@ func (f fakeDoctor) Diagnose(c context.Context, port int) (doctor.Report, error)
 	r := f.report
 	r.Port = port
 	return r, f.err
+}
+
+func (f fakeDoctor) Scan(c context.Context) (doctor.Overview, error) {
+	if f.block {
+		<-c.Done()
+		return doctor.Overview{}, c.Err()
+	}
+	return f.overview, f.scanErr
+}
+
+func overview() doctor.Overview {
+	return doctor.Overview{
+		Rows: []doctor.Row{{
+			Port:      8080,
+			Bind:      "all",
+			Process:   doctor.Process{PID: 18432, Name: "api-server", User: "sean"},
+			Listeners: []doctor.Listener{{Protocol: doctor.ProtocolTCP, Addr: netip.MustParseAddrPort("0.0.0.0:8080"), PID: 18432}},
+		}},
+		Notes: []string{"Containers were not checked: /var/run/docker.sock: boom."},
+	}
 }
 
 func useDoctor(t *testing.T, d Diagnoser, err error) {
@@ -87,6 +109,13 @@ func TestExitCodes(t *testing.T) {
 		{"in use", []string{"8080"}, fakeDoctor{report: inUse(42)}, nil, exitInUse},
 		{"help", []string{"--help"}, fakeDoctor{}, nil, exitAvailable},
 		{"version", []string{"--version"}, fakeDoctor{}, nil, exitAvailable},
+		{"scan, nothing listening", []string{"scan"}, fakeDoctor{}, nil, exitAvailable},
+		{"scan, ports listed", []string{"scan"}, fakeDoctor{overview: overview()}, nil, exitAvailable},
+		{"scan failed", []string{"scan"}, fakeDoctor{scanErr: errors.New("netstat failed")}, nil, exitError},
+		{"scan on unsupported platform", []string{"scan"}, nil, inspect.ErrUnsupportedPlatform, exitError},
+		{"scan with argument", []string{"scan", "8080"}, fakeDoctor{}, nil, exitError},
+		{"scan with unknown flag", []string{"scan", "--bogus"}, fakeDoctor{}, nil, exitError},
+		{"scan help", []string{"scan", "--help"}, fakeDoctor{}, nil, exitAvailable},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -111,6 +140,8 @@ func TestErrorMessages(t *testing.T) {
 		{"missing", nil, "Error: missing port argument\n"},
 		{"too many", []string{"1", "2", "3"}, "Error: expected one port argument, got 3\n"},
 		{"unknown flag", []string{"--bogus"}, "Error: unknown flag: --bogus\n"},
+		{"scan with argument", []string{"scan", "8080"}, "Error: scan takes no arguments, got 1\n"},
+		{"scan with unknown flag", []string{"scan", "--bogus"}, "Error: unknown flag: --bogus\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -151,13 +182,43 @@ func TestVersion(t *testing.T) {
 func TestHelp(t *testing.T) {
 	useDoctor(t, fakeDoctor{}, nil)
 	res := run(t, "--help")
-	for _, want := range []string{"Usage:\n  port-doctor <port>", "port-doctor 8080", "--version"} {
+	for _, want := range []string{"Usage:\n  port-doctor <port>", "port-doctor 8080", "--version", "  scan ", "port-doctor scan"} {
 		if !strings.Contains(res.stdout, want) {
 			t.Errorf("help output lacks %q:\n%s", want, res.stdout)
 		}
 	}
 	if strings.Contains(res.stdout, "completion") {
 		t.Errorf("help output should not advertise the completion command:\n%s", res.stdout)
+	}
+
+	res = run(t, "scan", "--help")
+	for _, want := range []string{"Usage:\n  port-doctor scan", "never connects to a port", "port-doctor scan | grep 8080"} {
+		if !strings.Contains(res.stdout, want) {
+			t.Errorf("scan help output lacks %q:\n%s", want, res.stdout)
+		}
+	}
+}
+
+func TestRendersOverview(t *testing.T) {
+	useDoctor(t, fakeDoctor{overview: overview()}, nil)
+	res := run(t, "scan")
+	if res.code != exitAvailable {
+		t.Fatalf("exit code = %d, stderr:\n%s", res.code, res.stderr)
+	}
+	want := "PORT  BIND  PID    PROCESS     USER  CONTAINER\n" +
+		"8080  all   18432  api-server  sean\n" +
+		"\n" +
+		"Containers were not checked: /var/run/docker.sock: boom.\n"
+	if res.stdout != want {
+		t.Errorf("stdout:\n%s\nwant:\n%s", res.stdout, want)
+	}
+	if res.stderr != "" {
+		t.Errorf("stderr = %q, want nothing", res.stderr)
+	}
+
+	useDoctor(t, fakeDoctor{}, nil)
+	if res := run(t, "scan"); res.stdout != "No TCP port is listening.\n" {
+		t.Errorf("empty scan stdout = %q", res.stdout)
 	}
 }
 
@@ -183,12 +244,14 @@ func TestInspectionTimeout(t *testing.T) {
 	t.Cleanup(func() { inspectTimeout = prev })
 	useDoctor(t, fakeDoctor{block: true}, nil)
 
-	res := run(t, "8080")
-	if res.code != exitError {
-		t.Fatalf("exit code = %d", res.code)
-	}
-	if res.stderr != "Error: inspection timed out after 20ms\n" {
-		t.Errorf("stderr = %q", res.stderr)
+	for _, args := range [][]string{{"8080"}, {"scan"}} {
+		res := run(t, args...)
+		if res.code != exitError {
+			t.Fatalf("%v: exit code = %d", args, res.code)
+		}
+		if res.stderr != "Error: inspection timed out after 20ms\n" {
+			t.Errorf("%v: stderr = %q", args, res.stderr)
+		}
 	}
 }
 
@@ -245,5 +308,45 @@ func TestEndToEnd(t *testing.T) {
 	res = run(t, fmt.Sprint(port))
 	if res.code != exitAvailable || !strings.HasPrefix(res.stdout, fmt.Sprintf("✓ Port %d is available\n", port)) {
 		t.Errorf("after close: exit code = %d\nstdout:\n%s\nstderr:\n%s", res.code, res.stdout, res.stderr)
+	}
+}
+
+// TestScanEndToEnd runs the real inspectors and expects the test process's
+// own listener among the rows, whatever else the machine has open. Other
+// users' listeners may add an "could not be identified" note.
+func TestScanEndToEnd(t *testing.T) {
+	if _, err := inspect.New(); err != nil {
+		t.Skip(err)
+	}
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	res := run(t, "scan")
+	if res.code != exitAvailable {
+		t.Fatalf("exit code = %d, want %d\nstdout:\n%s\nstderr:\n%s", res.code, exitAvailable, res.stdout, res.stderr)
+	}
+	if res.stderr != "" {
+		t.Errorf("stderr = %q, want nothing", res.stderr)
+	}
+	lines := strings.Split(strings.TrimRight(res.stdout, "\n"), "\n")
+	if header := strings.Fields(lines[0]); strings.Join(header, " ") != "PORT BIND PID PROCESS USER CONTAINER" {
+		t.Errorf("first line = %q, want the header", lines[0])
+	}
+	found := 0
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && fields[0] == fmt.Sprint(port) {
+			found++
+			if fields[1] != "localhost" || fields[2] != fmt.Sprint(os.Getpid()) {
+				t.Errorf("own row = %q, want localhost and PID %d", line, os.Getpid())
+			}
+		}
+	}
+	if found != 1 {
+		t.Errorf("found %d rows for port %d, want 1:\n%s", found, port, res.stdout)
 	}
 }
